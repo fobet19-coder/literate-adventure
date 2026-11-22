@@ -1,0 +1,289 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local PathfindingService = game:GetService("PathfindingService")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
+
+local player = Players.LocalPlayer
+local desplazando = false
+local velocidad = 80
+local DISTANCIA_TRAMO = 200
+local ultimoSalto = 0
+
+-- 1. Interfaz flotante
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "AltaVelocidadDeltaGUI"
+screenGui.ResetOnSpawn = false
+pcall(function() screenGui.Parent = CoreGui end)
+if not screenGui.Parent then screenGui.Parent = player:WaitForChild("PlayerGui") end
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 185, 0, 90)
+frame.Position = UDim2.new(0.5, -92, 0.2, 0)
+frame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+frame.Active = true
+frame.Draggable = true
+frame.Parent = screenGui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+local boton = Instance.new("TextButton")
+boton.Size = UDim2.new(1, -10, 0, 42)
+boton.Position = UDim2.new(0, 5, 0, 5)
+boton.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+boton.TextColor3 = Color3.fromRGB(255, 255, 255)
+boton.Font = Enum.Font.GothamBold
+boton.TextSize = 13
+boton.Text = "Deslizar Rápido: OFF"
+boton.Parent = frame
+Instance.new("UICorner", boton).CornerRadius = UDim.new(0, 6)
+
+local btnMenos = Instance.new("TextButton")
+btnMenos.Size = UDim2.new(0, 35, 0, 32)
+btnMenos.Position = UDim2.new(0, 5, 0, 52)
+btnMenos.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+btnMenos.TextColor3 = Color3.fromRGB(255, 255, 255)
+btnMenos.Font = Enum.Font.GothamBold
+btnMenos.TextSize = 16
+btnMenos.Text = "-"
+btnMenos.Parent = frame
+Instance.new("UICorner", btnMenos).CornerRadius = UDim.new(0, 6)
+
+local labelVel = Instance.new("TextLabel")
+labelVel.Size = UDim2.new(1, -80, 0, 32)
+labelVel.Position = UDim2.new(0, 40, 0, 52)
+labelVel.BackgroundTransparency = 1
+labelVel.TextColor3 = Color3.fromRGB(200, 200, 200)
+labelVel.Font = Enum.Font.GothamSemibold
+labelVel.TextSize = 13
+labelVel.Text = "Vel: " .. velocidad
+labelVel.Parent = frame
+
+local btnMas = Instance.new("TextButton")
+btnMas.Size = UDim2.new(0, 35, 0, 32)
+btnMas.Position = UDim2.new(1, -40, 0, 52)
+btnMas.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+btnMas.TextColor3 = Color3.fromRGB(255, 255, 255)
+btnMas.Font = Enum.Font.GothamBold
+btnMas.TextSize = 16
+btnMas.Text = "+"
+btnMas.Parent = frame
+Instance.new("UICorner", btnMas).CornerRadius = UDim.new(0, 6)
+
+local function detenerTodo(texto)
+    desplazando = false
+    boton.Text = texto or "Deslizar Rápido: OFF"
+    boton.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+end
+
+local function ejecutarSaltoValla(humanoid, rootPart)
+    if tick() - ultimoSalto < 0.75 then return end
+    ultimoSalto = tick()
+
+    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+    local velActual = rootPart.AssemblyLinearVelocity
+    rootPart.AssemblyLinearVelocity = Vector3.new(velActual.X, math.max(humanoid.JumpPower, 55), velActual.Z)
+end
+
+-- Sensor mejorado: ignora rampas o suelo inclinado para no saltar sin motivo a alta velocidad
+local function revisarVallaEnfrente(rootPart, character, direccion, pasoActual)
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {character}
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+    local alcance = math.clamp(pasoActual + 3.5, 4, 10)
+    local origenBajo = rootPart.Position - Vector3.new(0, 0.8, 0)
+    local hitBajo = Workspace:Raycast(origenBajo, direccion * alcance, rayParams)
+
+    -- Si la superficie detectada está inclinada (una rampa), su normal.Y es alta (> 0.5), no es valla
+    if not hitBajo or hitBajo.Normal.Y > 0.5 then
+        return false
+    end
+
+    local origenAlto = rootPart.Position + Vector3.new(0, 3.8, 0)
+    local hitAlto = Workspace:Raycast(origenAlto, direccion * alcance, rayParams)
+
+    return (hitAlto == nil)
+end
+
+local function obtenerAlturaSuelo(posicionXZ, character, humanoid, rootPart)
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {character}
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+    local origen = Vector3.new(posicionXZ.X, rootPart.Position.Y + 6, posicionXZ.Z)
+    local resultado = Workspace:Raycast(origen, Vector3.new(0, -30, 0), rayParams)
+
+    if resultado then
+        local alturaCadera = humanoid.HipHeight + (rootPart.Size.Y * 0.5)
+        return resultado.Position.Y + alturaCadera
+    end
+    return rootPart.Position.Y
+end
+
+local function calcularTramo(origenPos, direccion)
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 2.2,
+        AgentHeight = 5,
+        AgentCanJump = true,
+        AgentCanClimb = true,
+        WaypointSpacing = 16
+    })
+
+    local destino = origenPos + (direccion * DISTANCIA_TRAMO)
+    local exito = pcall(function()
+        path:ComputeAsync(origenPos, destino)
+    end)
+
+    if exito and path.Status == Enum.PathStatus.Success then
+        return path:GetWaypoints()
+    end
+    return nil
+end
+
+-- 2. Bucle principal blindado contra alta velocidad
+local function cicloAltaVelocidad()
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+
+    if not humanoid or not rootPart then
+        detenerTodo("Deslizar Rápido: OFF")
+        return
+    end
+
+    -- Evita que las físicas de Roblox hagan girar el personaje al chocar rápido
+    humanoid.AutoRotate = false
+
+    local waypointsActuales = calcularTramo(rootPart.Position, rootPart.CFrame.LookVector)
+    if not waypointsActuales then
+        humanoid.AutoRotate = true
+        detenerTodo("Camino cerrado (OFF)")
+        task.wait(1.2)
+        if not desplazando then boton.Text = "Deslizar Rápido: OFF" end
+        return
+    end
+
+    while desplazando do
+        character = player.Character
+        humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        rootPart = character and character:FindFirstChild("HumanoidRootPart")
+        if not humanoid or not rootPart then
+            detenerTodo("Deslizar Rápido: OFF")
+            break
+        end
+
+        humanoid.AutoRotate = false
+        local siguientesWaypoints = nil
+        local preCalculando = false
+        local totalPuntos = #waypointsActuales
+
+        for i = 2, totalPuntos do
+            if not desplazando then break end
+
+            if not preCalculando and i >= math.floor(totalPuntos * 0.55) then
+                preCalculando = true
+                local ultimoWp = waypointsActuales[totalPuntos]
+                local penultimoWp = waypointsActuales[math.max(1, totalPuntos - 1)]
+                local dirFinal = Vector3.new(ultimoWp.Position.X - penultimoWp.Position.X, 0, ultimoWp.Position.Z - penultimoWp.Position.Z)
+                dirFinal = dirFinal.Magnitude > 0.1 and dirFinal.Unit or rootPart.CFrame.LookVector
+
+                task.spawn(function()
+                    siguientesWaypoints = calcularTramo(ultimoWp.Position, dirFinal)
+                end)
+            end
+
+            local wp = waypointsActuales[i]
+            if wp.Action == Enum.PathWaypointAction.Jump then
+                ejecutarSaltoValla(humanoid, rootPart)
+            end
+
+            while desplazando and rootPart and rootPart.Parent do
+                local deltaTime = RunService.Heartbeat:Wait()
+                -- Anula cualquier rotación física accidental al ir rápido
+                rootPart.AssemblyAngularVelocity = Vector3.zero
+
+                local posActual = rootPart.Position
+                local objetivoHorizontal = Vector3.new(wp.Position.X, posActual.Y, wp.Position.Z)
+                local vectorPlano = objetivoHorizontal - posActual
+                local distanciaPlana = vectorPlano.Magnitude
+
+                local paso = velocidad * deltaTime
+
+                -- Si el paso es mayor que la distancia al punto, pasa directo al siguiente sin pasarse de largo
+                if distanciaPlana <= math.max(2.5, paso * 1.15) then
+                    break
+                end
+
+                local dirPlana = vectorPlano.Unit
+
+                if revisarVallaEnfrente(rootPart, character, dirPlana, paso) then
+                    ejecutarSaltoValla(humanoid, rootPart)
+                end
+
+                local siguientePosXZ = posActual + (dirPlana * paso)
+
+                local enElAire = (tick() - ultimoSalto < 0.5)
+                    or humanoid:GetState() == Enum.HumanoidStateType.Jumping
+                    or humanoid:GetState() == Enum.HumanoidStateType.Freefall
+
+                local yFinal
+                if enElAire then
+                    yFinal = posActual.Y
+                else
+                    rootPart.AssemblyLinearVelocity = Vector3.new(0, rootPart.AssemblyLinearVelocity.Y, 0)
+                    yFinal = obtenerAlturaSuelo(siguientePosXZ, character, humanoid, rootPart)
+                end
+
+                local nuevaPosicion = Vector3.new(siguientePosXZ.X, yFinal, siguientePosXZ.Z)
+                
+                -- Posición exacta (sin retraso de Lerp) y rotación suavizada solo en el ángulo
+                local rotacionActual = rootPart.CFrame.Rotation
+                local rotacionObjetivo = CFrame.lookAt(Vector3.zero, dirPlana).Rotation
+                local rotacionSuave = rotacionActual:Lerp(rotacionObjetivo, 0.35)
+
+                rootPart.CFrame = CFrame.new(nuevaPosicion) * rotacionSuave
+            end
+        end
+
+        if not desplazando then break end
+
+        if siguientesWaypoints then
+            waypointsActuales = siguientesWaypoints
+        else
+            waypointsActuales = calcularTramo(rootPart.Position, rootPart.CFrame.LookVector)
+            if not waypointsActuales then
+                detenerTodo("Camino cerrado (OFF)")
+                task.wait(1.2)
+                if not desplazando then boton.Text = "Deslizar Rápido: OFF" end
+                break
+            end
+        end
+    end
+
+    -- Restaura el control normal de giro al apagar
+    if player.Character and player.Character:FindFirstChildOfClass("Humanoid") then
+        player.Character:FindFirstChildOfClass("Humanoid").AutoRotate = true
+    end
+end
+
+-- 3. Controles de botones
+boton.MouseButton1Click:Connect(function()
+    desplazando = not desplazando
+    if desplazando then
+        boton.Text = "Deslizar Rápido: ON"
+        boton.BackgroundColor3 = Color3.fromRGB(40, 150, 80)
+        task.spawn(cicloAltaVelocidad)
+    else
+        detenerTodo("Deslizar Rápido: OFF")
+    end
+end)
+
+btnMas.MouseButton1Click:Connect(function()
+    velocidad = velocidad + 25
+    labelVel.Text = "Vel: " .. velocidad
+end)
+
+btnMenos.MouseButton1Click:Connect(function()
+    velocidad = math.max(20, velocidad - 25)
+    labelVel.Text = "Vel: " .. velocidad
+end)
